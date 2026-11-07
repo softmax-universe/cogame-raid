@@ -16,7 +16,7 @@ import os
 
 SEATS = 5
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SOURCE_URL = "https://github.com/Metta-AI/cogame-raid/tree/main"
+SOURCE_URL = "https://github.com/softmax-universe/cogame-raid/tree/main"
 
 
 def read(*parts):
