@@ -85,14 +85,31 @@ proc refreshSnapshotLocked() =
     socket.send(shared.snapshot)
 
 proc declarePlayerFailure(slot: int, message: string) =
-  ## The platform polls COGAME_PLAYER_FAILURE_URI so a lobby no-show is
-  ## charged to the seat that caused it. Best effort, and a no-op off-platform.
+  ## Reports an explicit policy failure to Coworld via COGAME_PLAYER_FAILURE_URI.
   try:
     writeCogameEnv("COGAME_PLAYER_FAILURE_URI",
-      $(%*{"failed_policy_index": slot, "message": message}),
+      $(%*{"failed_policy_index": slot, "message": runeCap(message, MaxDetailRunes)}),
       "application/json")
   except CatchableError as error:
     echo "raid: player-failure declaration failed: ", error.msg
+
+proc failEpisode(slot: int, message: string) =
+  ## Terminates an unplayed or invalid episode as an explicit policy failure
+  ## with no fabricated moves and no published results/scores.
+  let detail = runeCap(message, MaxDetailRunes)
+  echo "raid: policy failure on seat ", slot, " (", aliasOf(slot), "): ", detail
+  declarePlayerFailure(slot, detail)
+  let payload = $ %*{"done": true, "error": detail}
+  withLock stateLock:
+    if shared.finished:
+      return
+    shared.finished = true
+    for _, socket in shared.playerSockets:
+      try:
+        socket.send(payload)
+      except CatchableError:
+        discard
+  quit(1)
 
 proc requireFileUri*(name: string): string =
   let uri = getEnv(name)
@@ -228,18 +245,13 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         if not shared.everRegistered[slot]:
           if noShow < 0:
             noShow = slot
-          ## A seat that never connects does not end the episode: its cog is
-          ## driven by the stalwart baseline for the whole encounter.
-          shared.scripted[slot] = skStalwart
-          shared.kinds[slot] = "scripted"
-        gameSim.policyKinds[slot] = shared.kinds[slot]
+        else:
+          gameSim.policyKinds[slot] = shared.kinds[slot]
       echo "raid: starting with ", shared.playerSockets.len, "/",
         shared.seats, " players connected"
       refreshSnapshotLocked()
     if noShow >= 0:
-      declarePlayerFailure(noShow,
-        "player slot " & $noShow & " never registered; the seat played the " &
-        "stalwart baseline")
+      failEpisode(noShow, "player slot " & $noShow & " never registered")
 
     var kinds: seq[ScriptKind]
     withLock stateLock:
@@ -247,9 +259,15 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
 
     proc now(): float {.closure.} = epochTime() - gameStart
 
+    proc raisePolicyFailure(seat: int, message: string) {.noreturn.} =
+      var err = newException(PolicyFailureError, message)
+      err.seat = seat
+      raise err
+
     proc decide(view: Sim, seats: seq[int]): seq[Decision] {.closure.} =
       let started = epochTime()
       result = newSeq[Decision](seats.len)
+      var failMsg = newSeq[string](seats.len)
       var pending: seq[int]
       for index, seat in seats:
         if kinds[seat] != skNone:
@@ -268,15 +286,13 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         withLock stateLock:
           for index in pending:
             let seat = seats[index]
-            if shared.unavailable[seat] or not shared.registered[seat] or
+            if shared.unavailable[seat]:
+              raisePolicyFailure(seat,
+                "seat " & $seat & " has no LLM credentials configured")
+            if not shared.registered[seat] or
                 not shared.playerSockets.hasKey(seat):
-              result[index] = Decision(
-                order: scriptedOrder(view, seat, skStalwart),
-                source: osFallback, attempts: attempt + 1,
-                cause: (if shared.unavailable[seat]: fcNoCreds else: fcTransport),
-                detail: (if shared.unavailable[seat]: "no credentials"
-                         else: "player disconnected"))
-              continue
+              raisePolicyFailure(seat,
+                "seat " & $seat & " disconnected before decision")
             let id = (view.tick div config.turnTicks) * 2 + attempt + 1
             shared.requestIds[seat] = id
             shared.replies[seat] = nil
@@ -288,11 +304,9 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
                 "timeout_seconds": timeout
               })
               sent.add(index)
-            except CatchableError:
-              result[index] = Decision(
-                order: scriptedOrder(view, seat, skStalwart),
-                source: osFallback, attempts: attempt + 1,
-                cause: fcTransport, detail: "player socket send failed")
+            except CatchableError as error:
+              raisePolicyFailure(seat,
+                "seat " & $seat & " socket send failed: " & error.msg)
         let deadline = epochTime() + timeout.float
         while sent.len > 0 and epochTime() < deadline:
           var waiting = false
@@ -311,40 +325,34 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             reply = shared.replies[seat]
             shared.requestIds[seat] = 0
           if reply == nil:
-            result[index] = Decision(
-              order: scriptedOrder(view, seat, skStalwart),
-              source: osFallback, attempts: attempt + 1,
-              cause: fcTimeout, detail: "player decision timed out")
+            failMsg[index] = "seat " & $seat & " decision timed out"
             retry.add(index)
           elif reply.hasKey("cause"):
             let cause = reply["cause"].getStr()
-            let fallbackCause = case cause
-              of "no_credentials": fcNoCreds
-              of "parse_error": fcParse
-              else: fcTransport
-            result[index] = Decision(
-              order: scriptedOrder(view, seat, skStalwart),
-              source: osFallback, attempts: attempt + 1,
-              cause: fallbackCause,
-              detail: runeCap(reply{"error"}.getStr(), MaxDetailRunes))
-            if fallbackCause == fcNoCreds:
+            let detail = runeCap(reply{"error"}.getStr(), MaxDetailRunes)
+            failMsg[index] = "seat " & $seat & " " & cause &
+              (if detail.len > 0: ": " & detail else: "")
+            if cause == "no_credentials":
               withLock stateLock:
                 shared.unavailable[seat] = true
+              raisePolicyFailure(seat, failMsg[index])
             else:
               retry.add(index)
           else:
             try:
-              let raw = parseOrder(reply["action"], view.cogs[seat].role)
-              result[index] = Decision(order: repairOrder(view, seat, raw),
+              let actionNode = reply{"action"}
+              let order = parseStrictOrder(actionNode, view, seat)
+              result[index] = Decision(order: order,
                 source: osLlm, attempts: attempt + 1)
             except CatchableError as error:
-              result[index] = Decision(
-                order: scriptedOrder(view, seat, skStalwart),
-                source: osFallback, attempts: attempt + 1,
-                cause: fcParse,
-                detail: runeCap(error.msg, MaxDetailRunes))
+              let rawHead = runeCap($reply{"action"}, 80)
+              failMsg[index] = "seat " & $seat & " invalid order (" &
+                error.msg & "): " & rawHead
               retry.add(index)
         pending = retry
+      if pending.len > 0:
+        let index = pending[0]
+        raisePolicyFailure(seats[index], failMsg[index])
       let latency = int((epochTime() - started) * 1000.0)
       for i in 0 ..< result.len:
         if result[i].source != osScripted:
@@ -358,7 +366,10 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         " boss ", gameSim.boss.hp, "/", gameSim.boss.maxHp,
         " alive ", gameSim.aliveCount(), " at ", int(now()), "s"
 
-    runEncounter(gameSim, decide, now, kinds, onTurn)
+    try:
+      runEncounter(gameSim, decide, now, kinds, onTurn)
+    except PolicyFailureError as error:
+      failEpisode(error.seat, error.msg)
     finishEpisode(runtimeConfig)
     quit(0)
 
@@ -494,9 +505,8 @@ proc websocketHandler(websocket: WebSocket, event: WebSocketEvent,
         let node = payload{"scripted"}
         let scripted =
           if node == nil or node.kind == JNull: skNone
-          elif node.kind == JBool:
-            (if node.getBool(): skStalwart else: skNone)
-          else: parseScriptKind(node.getStr())
+          elif node.kind == JString: parseScriptKind(node.getStr())
+          else: raise newException(RaidError, "scripted must be a string or null")
         if kind == "scripted" and scripted == skNone or
             kind != "scripted" and scripted != skNone:
           raise newException(RaidError, "policy kind and baseline disagree")

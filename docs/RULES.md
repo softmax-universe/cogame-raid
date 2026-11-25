@@ -294,9 +294,10 @@ carries the detail and is a closed enum of exactly five.
 | `fault` | `sim_fault` | A sim invariant guard tripped. |
 | `fault` | `host_error` | An unexpected server-side exception. |
 
-A seat that never connects does **not** end the episode: its cog is driven by the
-`stalwart` scripted baseline for the whole encounter, the no-show is reported to
-`COGAME_PLAYER_FAILURE_URI`, and the raid plays on.
+A seat that fails to connect or register, or a model seat that fails to return
+a valid order within the turn budget, ends the episode immediately as an
+explicit policy failure via `COGAME_PLAYER_FAILURE_URI` without substituting a
+move or publishing participant scores.
 
 ## League operations (recorded, not sim logic)
 

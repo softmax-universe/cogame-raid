@@ -72,7 +72,6 @@ proc runEncounter*(sim: var Sim, decide: Decider, now: Clock,
   ## per turn, with every living seat in one call, so a simultaneous-decision
   ## game can batch them.
   let started = now()
-  var guarded = false
   sim.encounterStart()
   while not sim.done:
     if sim.turnBoundary():
@@ -80,35 +79,15 @@ proc runEncounter*(sim: var Sim, decide: Decider, now: Clock,
       if seats.len == 0:
         sim.finish("complete", "wipe")
         break
-      var decisions: seq[Decision]
-      let elapsed = now() - started
-      ## Budget guard: settle early on the scripted layer rather than
-      ## overrun, so the episode ends complete/* instead of deadline/*.
-      if not guarded and
-          elapsed + 2.0 * sim.config.turnBudgetSeconds >
-            sim.config.wallClockBudgetSeconds:
-        guarded = true
-        sim.record("budget_guard", %*{
-          "turn": sim.tick div sim.config.turnTicks,
-          "remaining_s": sim.config.wallClockBudgetSeconds - elapsed
-        })
-      if guarded:
-        decisions = scriptedDecisions(sim, seats, kinds)
-        for i in 0 ..< decisions.len:
-          decisions[i].source = osFallback
-          decisions[i].cause = fcBudget
-      else:
-        ## The per-turn deadline lives inside `decide`: the game sends all
-        ## private requests, then waits at most the attempt and retry budgets.
-        ## `config.validate` refuses a rounded sum above turnBudgetSeconds.
-        decisions = decide(sim, seats)
+      ## The per-turn deadline lives inside `decide`: the game sends all
+      ## private requests, then waits at most the attempt and retry budgets.
+      ## `config.validate` refuses a rounded sum above turnBudgetSeconds.
+      let decisions = decide(sim, seats)
       sim.applyTurn(seats, decisions)
       if onTurn != nil:
         onTurn(sim)
     if sim.tick mod TargetFps == 0 and
         now() - started > sim.config.wallClockBudgetSeconds:
-      ## The engine hard stop. Arithmetically unreachable once the budget
-      ## guard has engaged, but the check is unconditional.
       sim.finish("deadline", "wall_clock")
       break
     try:

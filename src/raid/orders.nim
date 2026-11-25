@@ -1,51 +1,30 @@
-## The order schema: tolerant parsing, world-aware repair, and the JSON both
-## the LLM and the scripted baselines emit.
-##
-## Parsing is deliberately forgiving (bullwhip's `extractJsonObject` shape):
-## markdown fences are stripped, a prose preamble is skipped to the outermost
-## balanced object, numbers may arrive as strings, and a target may arrive as
-## an integer. What cannot be recovered is repaired against the world instead
-## of rejected, so the control layer always has something legal to compile.
+## The order schema: strict JSON parsing and world validation for ordinary
+## players, plus world-aware repair for the factored numeric RL bridge.
 
 import std/[json, strutils, unicode]
 import types, state, labels
 
-proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first balanced {...} object out of a model response.
-  let start = text.find('{')
-  if start < 0:
-    var head = text.strip()
+proc parseJsonObject*(text: string): JsonNode =
+  ## Parses a strict single JSON object. No markdown fences or prose scraping.
+  let trimmed = text.strip()
+  if trimmed.len == 0 or trimmed[0] != '{':
+    var head = trimmed
     if head.runeLen > 160:
       head = head.runeSubStr(0, 160) & "..."
     raise newException(RaidError,
-      "no JSON object in response: " & head.replace("\n", " "))
-  var depth = 0
-  var inString = false
-  var escaped = false
-  for i in start ..< text.len:
-    let ch = text[i]
-    if inString:
-      if escaped:
-        escaped = false
-      elif ch == '\\':
-        escaped = true
-      elif ch == '"':
-        inString = false
-      continue
-    if ch == '"':
-      inString = true
-    elif ch == '{':
-      depth.inc
-    elif ch == '}':
-      depth.dec
-      if depth == 0:
-        return parseJson(text[start .. i])
-  ## Unbalanced: fall back to the last brace so a reply cut off mid-object
-  ## still has a chance.
-  let stop = text.rfind('}')
-  if stop <= start:
-    raise newException(RaidError, "unbalanced JSON object in response")
-  parseJson(text[start .. stop])
+      "response must be a single JSON object starting with '{': " &
+        head.replace("\n", " "))
+  let parsed = try:
+    parseJson(trimmed)
+  except CatchableError as error:
+    var head = trimmed
+    if head.runeLen > 160:
+      head = head.runeSubStr(0, 160) & "..."
+    raise newException(RaidError,
+      "invalid JSON object (" & error.msg & "): " & head.replace("\n", " "))
+  if parsed.kind != JObject:
+    raise newException(RaidError, "response must be a JSON object")
+  parsed
 
 proc parseIntent*(text: string): (Intent, bool) =
   let wanted = runeCap(text, MaxIntentRunes).toLowerAscii()
@@ -68,74 +47,54 @@ proc parseReaction*(text: string): (Reaction, bool) =
       return (reaction, true)
   (rxDodge, false)
 
-proc canonicalTarget*(node: JsonNode): string =
-  ## "" when nothing usable is there. `A<n>` and the five aliases are the only
-  ## shapes that survive; an integer 1..8 reads as an add, 0 as slot 0.
-  if node == nil:
+proc parseTargetStrict*(node: JsonNode): string =
+  ## Strict canonical target parsing: null/omitted/"" -> "", "boss",
+  ## "Alpha".."Echo", or "A<n>". Rejects integers and legacy aliases.
+  if node == nil or node.kind == JNull:
     return ""
-  case node.kind
-  of JNull:
+  if node.kind != JString:
+    raise newException(RaidError, "target must be a string or null")
+  let raw = node.getStr().strip()
+  if raw.len == 0:
     return ""
-  of JInt:
-    let value = node.getInt()
-    if value >= 1 and value <= 8:
-      return addName(value)
-    if value == 0:
-      return aliasOf(0)
-    return ""
-  of JString:
-    let raw = runeCap(node.getStr(), MaxTargetRunes).strip()
-    if raw.len == 0:
-      return ""
-    let lowered = raw.toLowerAscii()
-    if lowered == "boss" or lowered == "smelter-9" or lowered == "smelter9":
-      return "boss"
-    if lowered == "null" or lowered == "none":
-      return ""
-    let slot = slotOfAlias(raw)
-    if slot >= 0:
-      return aliasOf(slot)
-    if lowered.len >= 2 and lowered[0] == 'a':
-      try:
-        let n = parseInt(lowered[1 .. ^1])
-        if n >= 1 and n <= 99:
-          return addName(n)
-      except ValueError:
-        discard
+  if raw.runeLen > MaxTargetRunes:
+    raise newException(RaidError, "target exceeds " & $MaxTargetRunes & " runes")
+  let lowered = raw.toLowerAscii()
+  if lowered == "boss":
+    return "boss"
+  let slot = slotOfAlias(raw)
+  if slot >= 0:
+    return aliasOf(slot)
+  if raw.len >= 2 and raw[0] in {'A', 'a'}:
     try:
-      let n = parseInt(lowered)
-      if n >= 1 and n <= 8:
+      let n = parseInt(raw[1 .. ^1])
+      if n >= 1 and n <= 99:
         return addName(n)
-      if n == 0:
-        return aliasOf(0)
     except ValueError:
       discard
-    return ""
-  else:
-    return ""
+  raise newException(RaidError, "unknown target: " & runeCap(raw, 32))
 
-proc numberFrom(node: JsonNode, fallback: int): int =
+proc canonicalTarget*(node: JsonNode): string =
+  try:
+    parseTargetStrict(node)
+  except RaidError:
+    ""
+
+proc finiteCoord(node: JsonNode): int =
   if node == nil:
-    return fallback
+    raise newException(RaidError, "point coordinate is missing")
   case node.kind
   of JInt: node.getInt()
   of JFloat:
     let value = node.getFloat()
-    ## Reject a non-finite coordinate rather than letting it into the sim.
-    if value != value or value > 1.0e9 or value < -1.0e9: fallback
-    else: int(value)
-  of JString:
-    try: parseInt(node.getStr().strip())
-    except ValueError:
-      try: int(parseFloat(node.getStr().strip()))
-      except ValueError: fallback
-  else: fallback
+    if value != value or value > 1.0e9 or value < -1.0e9:
+      raise newException(RaidError, "point coordinate must be finite")
+    int(value)
+  else:
+    raise newException(RaidError, "point coordinates must be numbers")
 
 proc parseOrder*(node: JsonNode, role = roleDps): Order =
-  ## Shape-level parse only; `repairOrder` does the world-aware half. An
-  ## unknown enum value falls to the role's default rather than failing the
-  ## reply — only a MISSING intent is unrecoverable, and that is what makes
-  ## the retry fire.
+  ## Shape-level parse used by the numeric RL bridge and strict order parser.
   if node == nil or node.kind != JObject:
     raise newException(RaidError, "order must be a JSON object")
   let intentNode = node{"intent"}
@@ -154,10 +113,13 @@ proc parseOrder*(node: JsonNode, role = roleDps): Order =
     say: runeCap(node{"say"}.getStr(), MaxSayRunes)
   )
   let point = node{"point"}
-  if point != nil and point.kind == JArray and point.len >= 2:
-    result.px = numberFrom(point[0], PitCx)
-    result.py = numberFrom(point[1], PitCy)
-    result.hasPoint = true
+  if point != nil and point.kind == JArray and point.len == 2:
+    try:
+      result.px = finiteCoord(point[0])
+      result.py = finiteCoord(point[1])
+      result.hasPoint = true
+    except RaidError:
+      discard
 
 proc orderToJson*(order: Order): JsonNode =
   %*{
@@ -267,3 +229,88 @@ proc validateOrder*(sim: Sim, slot: int, order: Order): string =
   if order.say.runeLen > MaxSayRunes:
     return "say over " & $MaxSayRunes & " runes"
   ""
+
+proc parseStrictOrder*(node: JsonNode, sim: Sim, slot: int): Order =
+  ## Strict order parser and world validator for the ordinary player protocol.
+  ## Rejects unknown or wrong-role intents, unknown stations/reactions, illegal
+  ## or dead targets, and malformed points instead of fabricating substitutes.
+  if node == nil or node.kind != JObject:
+    raise newException(RaidError, "order must be a JSON object")
+  let role = sim.cogs[slot].role
+
+  let intentNode = node{"intent"}
+  if intentNode == nil or intentNode.kind != JString or
+      intentNode.getStr().strip().len == 0:
+    raise newException(RaidError, "order is missing required string field 'intent'")
+  let (intent, intentOk) = parseIntent(intentNode.getStr().strip())
+  if not intentOk:
+    raise newException(RaidError, "unknown intent: " &
+      runeCap(intentNode.getStr(), 32))
+  if not intentLegalFor(intent, role):
+    raise newException(RaidError, "intent " & $intent & " is illegal for role " & $role)
+
+  let stationNode = node{"station"}
+  if stationNode == nil or stationNode.kind != JString or
+      stationNode.getStr().strip().len == 0:
+    raise newException(RaidError, "order is missing required string field 'station'")
+  let (station, stationOk) = parseStation(stationNode.getStr().strip())
+  if not stationOk:
+    raise newException(RaidError, "unknown station: " &
+      runeCap(stationNode.getStr(), 32))
+
+  let reactionNode = node{"on_telegraph"}
+  if reactionNode == nil or reactionNode.kind != JString or
+      reactionNode.getStr().strip().len == 0:
+    raise newException(RaidError,
+      "order is missing required string field 'on_telegraph'")
+  let (reaction, reactionOk) = parseReaction(reactionNode.getStr().strip())
+  if not reactionOk:
+    raise newException(RaidError, "unknown on_telegraph: " &
+      runeCap(reactionNode.getStr(), 32))
+
+  let target = parseTargetStrict(node{"target"})
+  if target.len > 0:
+    if not targetLegalFor(intent, target):
+      raise newException(RaidError, "target " & target & " is illegal for intent " & $intent)
+    if not sim.entityAlive(target):
+      raise newException(RaidError, "target " & target & " is not alive")
+  elif requiresTarget(intent):
+    raise newException(RaidError, "intent " & $intent & " requires a live target")
+
+  var px = sim.cogs[slot].x
+  var py = sim.cogs[slot].y
+  let pointNode = node{"point"}
+  if pointNode != nil and pointNode.kind != JNull:
+    if pointNode.kind != JArray or pointNode.len != 2:
+      raise newException(RaidError, "point must be a 2-element [x, y] array")
+    px = finiteCoord(pointNode[0])
+    py = finiteCoord(pointNode[1])
+  elif station == stPoint:
+    raise newException(RaidError, "station 'point' requires a [x, y] point array")
+  let clamped = clampIntoPit(px, py)
+
+  var note = ""
+  let noteNode = node{"note"}
+  if noteNode != nil and noteNode.kind != JNull:
+    if noteNode.kind != JString:
+      raise newException(RaidError, "note must be a string")
+    note = runeCap(noteNode.getStr(), MaxNoteRunes)
+
+  var say = ""
+  let sayNode = node{"say"}
+  if sayNode != nil and sayNode.kind != JNull:
+    if sayNode.kind != JString:
+      raise newException(RaidError, "say must be a string")
+    say = runeCap(sayNode.getStr(), MaxSayRunes)
+
+  Order(
+    intent: intent,
+    target: target,
+    station: station,
+    px: clamped[0],
+    py: clamped[1],
+    hasPoint: true,
+    onTelegraph: reaction,
+    note: note,
+    say: say
+  )

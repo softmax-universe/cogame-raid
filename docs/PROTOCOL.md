@@ -13,7 +13,7 @@ Two protocols and one file format:
 The game sends each living seat its private view over the normal player socket.
 Prompt and external players return complete orders. All living seats receive their
 requests before the game waits, preserving simultaneous decisions. The game
-owns order validation and repair, bounded retries, scripted fallback, results,
+owns strict order validation, bounded retries, explicit policy failure, results,
 and replay. Model credentials and operator prompts stay in player containers.
 
 ### player → game
@@ -25,9 +25,10 @@ On connect:
  "scripted":"stalwart|greenhorn|null", "policy":"<label, <=48 runes>"}
 ```
 
-A scripted policy names its baseline. Prompt and external policies send a null
-baseline. A seat that never registers plays `stalwart` and is reported through
-`COGAME_PLAYER_FAILURE_URI`.
+A scripted policy names its baseline (`stalwart` or `greenhorn`). Prompt and
+external policies send a null baseline. A seat that never registers ends the
+episode as an explicit policy failure via `COGAME_PLAYER_FAILURE_URI` with no
+scores published.
 
 For each decision request, the player replies with exactly the matching `id`:
 
@@ -39,9 +40,10 @@ For each decision request, the player replies with exactly the matching `id`:
 
 A player unable to decide sends `{"type":"action","id":35,
 "cause":"no_credentials|parse_error|transport_error","error":"<detail>"}`.
-The game retries invalid replies once within the configured turn budget, then
-uses `stalwart`. A missing credential disables further model requests for that
-seat. Late replies with an old `id` are ignored.
+The game retries invalid replies or timeouts once within the configured turn
+budget. Missing credentials, disconnects, or a failed retry terminate the
+episode immediately via `COGAME_PLAYER_FAILURE_URI` without substituting any
+move or publishing scores. Late replies with an old `id` are ignored.
 
 ### game → player
 
@@ -151,29 +153,29 @@ shape.
  "say": "tank heals, dodge pours"}
 ```
 
-| Field | Type | Cap / legal values | Repair when violated |
+| Field | Type | Cap / legal values | Validation / bounds |
 |---|---|---|---|
-| `intent` | enum, ≤ 16 runes | tank: `tank_boss` `taunt` `pick_up_adds` `kite` `soak` `wait`; healer: `heal_lowest` `heal_target` `shield_target` `conserve` `soak` `wait`; dps: `burn_boss` `kill_adds` `interrupt` `assist_target` `soak` `wait` | unknown, or legal for another role → `tank_boss` / `heal_lowest` / `burn_boss` |
-| `target` | string / null, ≤ 12 runes | `boss`, `A1`…`A8`, `Alpha`…`Echo`; case-insensitive | unknown id, dead entity, or an id illegal for the intent → the intent's natural target; none available → the intent degrades to `wait` |
-| `station` | enum, ≤ 8 runes | `melee` `ranged` `spread` `edge` `point` `soak` | → `melee` for a tank, `ranged` otherwise |
-| `point` | `[int, int]` | clamped into the pit (anything beyond 288 px from (617,329) is pulled onto that circle) | missing / non-finite → the cog's current position |
-| `on_telegraph` | enum, ≤ 8 runes | `dodge` `hold` `soak` `spread` | → `dodge` |
+| `intent` | enum, ≤ 16 runes | tank: `tank_boss` `taunt` `pick_up_adds` `kite` `soak` `wait`; healer: `heal_lowest` `heal_target` `shield_target` `conserve` `soak` `wait`; dps: `burn_boss` `kill_adds` `interrupt` `assist_target` `soak` `wait` | required; unknown or wrong-role intent is rejected |
+| `target` | string / null, ≤ 12 runes | `boss`, `A1`…`A8`, `Alpha`…`Echo`, or `null` | unknown, dead, non-string, or illegal target for the intent is rejected |
+| `station` | enum, ≤ 8 runes | `melee` `ranged` `spread` `edge` `point` `soak` | required; unknown station is rejected |
+| `point` | `[int, int]` | clamped into the pit (anything beyond 288 px from (617,329) is pulled onto that circle) | required when `station == "point"`; non-numeric or malformed array is rejected |
+| `on_telegraph` | enum, ≤ 8 runes | `dodge` `hold` `soak` `spread` | required; unknown reaction is rejected |
 | `note` | string | ≤ 160 runes | truncated to 160 runes |
 | `say` | string | ≤ 32 runes | truncated to 32 runes |
 
 Three further caps on strings that reach the replay: `register.policy` ≤ 48
-runes, any recorded error text (`fallback.detail`) ≤ 200 runes, and
-`register.prompt` ≤ 4000 runes at the transport.
+runes, any recorded error text ≤ 200 runes, and `register.prompt` ≤ 4000 runes
+at the transport.
 
 **Truncation is on rune (Unicode codepoint) boundaries, never bytes.** A
 byte-truncated multi-byte character is exactly the bug that makes replay bytes
 render in a browser and fail a strict JSON parser.
 
-**Parsing is tolerant:** markdown fences are stripped, the outermost balanced
-`{…}` is taken if the model prefixed prose, numeric strings inside `point` are
-accepted, and `target` may arrive as an integer 1–8 (read as `A<n>`) or 0 (read
-as slot 0's alias). Only when no object with a usable `intent` can be recovered
-does the retry, and then the fallback, fire.
+**Parsing is strict:** the model reply must be a single valid JSON object
+beginning with `{` (no markdown fences, no prose preamble, no legacy numeric
+target aliases). Any parse or validation failure triggers at most one retry
+within the turn budget, and if still invalid, ends the episode as an explicit
+policy failure with no substitute move.
 
 ### The control layer
 

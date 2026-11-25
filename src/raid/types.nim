@@ -151,10 +151,11 @@ const
 
 type
   RaidError* = object of CatchableError
+  PolicyFailureError* = object of RaidError
+    seat*: int
 
   ScriptKind* = enum
-    ## Which scripted baseline drives a seat. `PLAYER_SCRIPTED` selects one;
-    ## a seat that never registers plays `stalwart`.
+    ## Which scripted baseline drives a seat. `PLAYER_SCRIPTED` selects one.
     skNone = "none"
     skStalwart = "stalwart"
     skGreenhorn = "greenhorn"

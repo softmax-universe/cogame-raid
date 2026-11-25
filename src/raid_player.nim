@@ -1,7 +1,7 @@
 ## Raid player: prompt and scripted policies use one seat socket.
 ##
-## PLAYER_SCRIPTED=stalwart (or 1) registers the seat as the built-in stalwart
-## baseline instead; PLAYER_SCRIPTED=greenhorn as the weaker one. The server
+## PLAYER_SCRIPTED=stalwart registers the seat as the built-in stalwart
+## baseline; PLAYER_SCRIPTED=greenhorn as the weaker one. The server
 ## plays scripted baselines deterministically.
 ##
 ## To field your own policy, reuse this image and set PLAYER_PROMPT:
@@ -11,7 +11,7 @@
 import std/[json, options, os, strutils]
 import curly
 import whisky
-import raid/[llm, orders, types]
+import raid/[baselines, llm, orders, types]
 
 const
   ConnectAttempts = 5
@@ -37,6 +37,8 @@ when isMainModule:
     quit("COWORLD_PLAYER_WS_URL is not set", 1)
   var prompt = getEnv("PLAYER_PROMPT")
   let scripted = getEnv("PLAYER_SCRIPTED").strip()
+  if scripted.len > 0 and parseScriptKind(scripted) == skNone:
+    quit("raid player: unknown PLAYER_SCRIPTED value: " & scripted, 1)
   if prompt.strip().len == 0 and scripted.len == 0:
     prompt = DefaultPrompt
   let policy = getEnv("PLAYER_POLICY_LABEL")
@@ -49,7 +51,7 @@ when isMainModule:
     $ %*{
       "type": "register",
       "kind": kind,
-      "scripted": scripted,
+      "scripted": (if scripted.len > 0: %scripted else: newJNull()),
       "policy": policy
     }
 
@@ -61,8 +63,6 @@ when isMainModule:
     except CatchableError as error:
       echo "raid player: connect attempt ", attempt, " failed: ", error.msg
       if attempt == ConnectAttempts:
-        ## A bounded retry, then leave quietly: the game declares the no-show
-        ## itself and plays the seat on the stalwart baseline.
         echo "raid player: giving up on ", url
         quit(0)
       sleep(ConnectBackoffMs * attempt)
@@ -71,11 +71,6 @@ when isMainModule:
   echo "raid player: registered as ", kind
 
   while true:
-    ## whisky raises rather than returning none on both a close frame and a
-    ## half-read one, and mummy's `send` only queues: the game writes its
-    ## artifacts and exits, so a seat can lose the socket before its `done`
-    ## frame is flushed. The episode is over either way — a player that dies
-    ## here exits 1 and fails certification with `player_error`.
     var received: Option[Message]
     try:
       received = socket.receiveMessage()
@@ -91,14 +86,15 @@ when isMainModule:
     try:
       let payload = parseJson(message.data)
       if payload{"done"}.getBool():
-        echo "raid player: final scores ", payload{"result"}{"scores"}
+        if payload.hasKey("result"):
+          echo "raid player: final scores ", payload{"result"}{"scores"}
+        elif payload.hasKey("error"):
+          echo "raid player: episode failed: ", payload{"error"}.getStr()
         break
       case payload{"type"}.getStr()
       of "welcome":
         echo "raid player: seated at slot ", payload{"slot"}.getInt(),
           " as ", payload{"alias"}.getStr()
-        ## Re-deliver the registration in case the first send raced the
-        ## server's slot bookkeeping.
         socket.send(registerFrame())
       of "turn":
         discard
@@ -106,16 +102,17 @@ when isMainModule:
         var reply = %*{"type": "action", "id": payload["id"]}
         if kind == "prompt" and client.disabled:
           reply["cause"] = %"no_credentials"
-          reply["error"] = %"no credentials"
+          reply["error"] = %"no LLM credentials configured"
         else:
           try:
             var user = userPrompt(payload["view"], prompt)
             if payload["retry"].getBool():
               user.add(RetryHint)
-            let request = client.requestFor(payload["system"].getStr(), user, -1)
+            let slot = payload{"slot"}.getInt(-1)
+            let request = client.requestFor(payload["system"].getStr(), user, slot)
             let response = client.curl.post(request.url, request.headers,
               request.body, payload["timeout_seconds"].getInt())
-            reply["action"] = extractJsonObject(
+            reply["action"] = parseJsonObject(
               client.textOf(response, "", request.url))
           except LlmError as error:
             reply["cause"] = %"transport_error"

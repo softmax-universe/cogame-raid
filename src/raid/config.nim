@@ -135,9 +135,6 @@ proc update*(config: var GameConfig, configJson: string) =
   if node.hasKey("playerConnectTimeoutSeconds"):
     config.playerConnectTimeoutSeconds =
       node["playerConnectTimeoutSeconds"].getFloat()
-  if node.hasKey("player_connect_timeout_seconds"):
-    config.playerConnectTimeoutSeconds =
-      node["player_connect_timeout_seconds"].getFloat()
   if node.hasKey("mapPath"):
     config.mapPath = node["mapPath"].getStr()
   if node.hasKey("llmAttemptSeconds"):
