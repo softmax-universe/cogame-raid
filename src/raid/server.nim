@@ -84,40 +84,8 @@ proc refreshSnapshotLocked() =
   for socket in shared.globalSockets:
     socket.send(shared.snapshot)
 
-proc declarePlayerFailure(slot: int, message: string) =
-  ## Reports an explicit policy failure to Coworld via COGAME_PLAYER_FAILURE_URI.
-  try:
-    writeCogameEnv("COGAME_PLAYER_FAILURE_URI",
-      $(%*{"failed_policy_index": slot, "message": runeCap(message, MaxDetailRunes)}),
-      "application/json")
-  except CatchableError as error:
-    echo "raid: player-failure declaration failed: ", error.msg
-
-proc failEpisode(slot: int, message: string) =
-  ## Terminates an unplayed or invalid episode as an explicit policy failure
-  ## with no fabricated moves and no published results/scores.
-  let detail = runeCap(message, MaxDetailRunes)
-  echo "raid: policy failure on seat ", slot, " (", aliasOf(slot), "): ", detail
-  declarePlayerFailure(slot, detail)
-  let payload = $ %*{"done": true, "error": detail}
-  withLock stateLock:
-    if shared.finished:
-      return
-    shared.finished = true
-    for _, socket in shared.playerSockets:
-      try:
-        socket.send(payload)
-      except CatchableError:
-        discard
-  quit(1)
-
-proc requireFileUri*(name: string): string =
-  let uri = getEnv(name)
-  if uri.len == 0:
-    return ""
-  if not uri.startsWith("file://"):
-    raise newException(RaidError, name & " must be a file:// path, got: " & uri)
-  uri[7 .. ^1]
+const
+  MaxFailureMessageRunes = 1000
 
 proc writeArtifact(uri, data, contentType, methodEnv: string) =
   if uri.len == 0:
@@ -132,6 +100,58 @@ proc writeArtifact(uri, data, contentType, methodEnv: string) =
       raise newException(IOError, "artifact POST failed: " & $response.code)
   else:
     writeCogameUri(uri, data, contentType, methodEnv)
+
+proc declarePlayerFailure(slot: int, message: string) =
+  ## Reports an explicit policy failure to Coworld via COGAME_PLAYER_FAILURE_URI.
+  try:
+    writeCogameEnv("COGAME_PLAYER_FAILURE_URI",
+      $(%*{"failed_policy_index": slot,
+           "message": runeCap(message, MaxFailureMessageRunes)}),
+      "application/json")
+  except CatchableError as error:
+    echo "raid: player-failure declaration failed: ", error.msg
+
+proc failEpisode(runtimeConfig: RuntimeConfig, slot: int, message: string) =
+  ## Terminates an unplayed or invalid episode as an explicit policy failure
+  ## with no fabricated moves and no published results/scores. Retains partial
+  ## replay progress when ticks have elapsed.
+  let detail = runeCap(message, MaxFailureMessageRunes)
+  echo "raid: policy failure on seat ", slot, " (", aliasOf(slot), "): ", detail
+  var partialReplay = ""
+  let payload = $ %*{"done": true, "error": runeCap(detail, 500)}
+  withLock stateLock:
+    if shared.finished:
+      return
+    shared.finished = true
+    if gameSim.tick > 0 and runtimeConfig.replayUri.len > 0:
+      gameSim.record("policy_failure", %*{
+        "turn": gameSim.turn, "seat": slot, "alias": aliasOf(slot),
+        "detail": runeCap(detail, 500)
+      })
+      partialReplay = replayBytes(gameSim)
+    for _, socket in shared.playerSockets:
+      try:
+        socket.send(payload)
+      except CatchableError:
+        discard
+  if partialReplay.len > 0:
+    try:
+      echo "raid: preserving partial replay (", partialReplay.len,
+        " bytes, tick ", gameSim.tick, ")"
+      writeArtifact(runtimeConfig.replayUri, partialReplay, "application/json",
+        "COGAME_SAVE_REPLAY_METHOD")
+    except CatchableError as error:
+      echo "raid: partial replay write failed: ", error.msg
+  declarePlayerFailure(slot, detail)
+  quit(1)
+
+proc requireFileUri*(name: string): string =
+  let uri = getEnv(name)
+  if uri.len == 0:
+    return ""
+  if not uri.startsWith("file://"):
+    raise newException(RaidError, name & " must be a file:// path, got: " & uri)
+  uri[7 .. ^1]
 
 proc pushTurnFrames() =
   ## Post-order informational frame. A dead seat gets one frame with
@@ -251,7 +271,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         shared.seats, " players connected"
       refreshSnapshotLocked()
     if noShow >= 0:
-      failEpisode(noShow, "player slot " & $noShow & " never registered")
+      failEpisode(runtimeConfig, noShow, "player slot " & $noShow & " never registered")
 
     var kinds: seq[ScriptKind]
     withLock stateLock:
@@ -329,10 +349,10 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             retry.add(index)
           elif reply.hasKey("cause"):
             let cause = reply["cause"].getStr()
-            let detail = runeCap(reply{"error"}.getStr(), MaxDetailRunes)
+            let detail = runeCap(reply{"error"}.getStr(), 500)
             failMsg[index] = "seat " & $seat & " " & cause &
               (if detail.len > 0: ": " & detail else: "")
-            if cause == "no_credentials":
+            if cause == "no_credentials" or cause == "auth_error":
               withLock stateLock:
                 shared.unavailable[seat] = true
               raisePolicyFailure(seat, failMsg[index])
@@ -345,7 +365,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               result[index] = Decision(order: order,
                 source: osLlm, attempts: attempt + 1)
             except CatchableError as error:
-              let rawHead = runeCap($reply{"action"}, 80)
+              let rawHead = runeCap($reply{"action"}, 400)
               failMsg[index] = "seat " & $seat & " invalid order (" &
                 error.msg & "): " & rawHead
               retry.add(index)
@@ -369,7 +389,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
     try:
       runEncounter(gameSim, decide, now, kinds, onTurn)
     except PolicyFailureError as error:
-      failEpisode(error.seat, error.msg)
+      failEpisode(runtimeConfig, error.seat, error.msg)
     finishEpisode(runtimeConfig)
     quit(0)
 
@@ -529,8 +549,8 @@ proc websocketHandler(websocket: WebSocket, event: WebSocketEvent,
           shared.socketSlots.del(websocket)
           if shared.playerSockets.getOrDefault(slot) == websocket:
             shared.playerSockets.del(slot)
-          ## A seat that drops keeps playing: its order source degrades to
-          ## the stalwart baseline and revives on reconnect.
+          ## A non-scripted seat that drops is marked unregistered so the next
+          ## decision fails cleanly instead of fabricating a move.
           if shared.everRegistered[slot] and shared.scripted[slot] == skNone:
             shared.registered[slot] = false
         shared.globalSockets.excl(websocket)

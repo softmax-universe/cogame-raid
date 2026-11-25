@@ -18,9 +18,9 @@ const
   ConnectBackoffMs = 250
   DefaultPrompt = """
 Play the role you were dealt and do not improvise a second plan.
-TANK: stand north of the boss at point [617,180] with on_telegraph "hold" so
-every cleave points at empty floor, and taunt the moment the boss's target in
-your view is not you.
+TANK: stand north of the boss at point [617,293] with on_telegraph "hold" so
+every cleave points at empty floor while staying in 40 px melee range, and
+taunt the moment the boss's target in your view is not you.
 HEALER: station "ranged" with a clear line to the tank, "heal_lowest" while
 anyone is under 60% and "conserve" above 75% - your mana pool is a burst
 reserve, not a budget. on_telegraph "dodge" always.
@@ -101,8 +101,12 @@ when isMainModule:
       of "decision":
         var reply = %*{"type": "action", "id": payload["id"]}
         if kind == "prompt" and client.disabled:
-          reply["cause"] = %"no_credentials"
-          reply["error"] = %"no LLM credentials configured"
+          if client.disabledReason.len > 0:
+            reply["cause"] = %"auth_error"
+            reply["error"] = %client.disabledReason
+          else:
+            reply["cause"] = %"no_credentials"
+            reply["error"] = %"no LLM credentials configured"
         else:
           try:
             var user = userPrompt(payload["view"], prompt)
@@ -115,7 +119,8 @@ when isMainModule:
             reply["action"] = parseJsonObject(
               client.textOf(response, "", request.url))
           except LlmError as error:
-            reply["cause"] = %"transport_error"
+            reply["cause"] = %(if client.disabledReason.len > 0: "auth_error"
+              else: "transport_error")
             reply["error"] = %error.msg
           except RaidError as error:
             reply["cause"] = %"parse_error"
