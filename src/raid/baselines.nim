@@ -55,12 +55,10 @@ const
   ]
 
 proc parseScriptKind*(text: string): ScriptKind =
-  ## PLAYER_SCRIPTED values. Bullwhip's shape (`src/bullwhip/llm.nim:61`):
-  ## "1"/"true"/"yes"/"stalwart" play the stalwart bot, "greenhorn" the weak
-  ## one, anything else nothing.
+  ## Canonical PLAYER_SCRIPTED values: "stalwart" or "greenhorn".
   case text.strip().toLowerAscii()
-  of "1", "true", "yes", "stalwart", "default": skStalwart
-  of "greenhorn", "green", "novice": skGreenhorn
+  of "stalwart": skStalwart
+  of "greenhorn": skGreenhorn
   else: skNone
 
 proc liveTelegraphKind(sim: Sim): int =
@@ -305,7 +303,7 @@ proc stalwartDps(sim: Sim, slot: int): Order =
     ## between a dps and a moving add is most of the reason adds live long
     ## enough for Feed to matter.
     result.intent = inKillAdds
-    result.target = ""
+    result.target = naturalTarget(sim, slot, inKillAdds)
     result.note = "crawlers up; clearing them before Feed lands"
     result.say = "killing adds"
 

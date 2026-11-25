@@ -63,8 +63,12 @@ prefix="${slug}-smoke-${run_id}"
 network="${prefix}-net"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/${slug}-smoke.XXXXXX")"
 seats=0
+stub_pid=""
 
 cleanup() {
+  if [ -n "${stub_pid}" ]; then
+    kill "${stub_pid}" >/dev/null 2>&1 || true
+  fi
   docker ps -aq --filter "name=${prefix}" | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker network rm "${network}" >/dev/null 2>&1 || true
   rm -rf "${work_dir}"
@@ -160,11 +164,15 @@ with open(os.path.join(work, "config.json"), "w") as fh:
 by_id = {p.get("id"): p for p in (manifest.get("player") or [])}
 extra_env = [kv for kv in (os.environ.get("SMOKE_EXTRA_ENV") or "").split() if "=" in kv]
 
+llm_slots = []
 for slot in range(seats):
     player_id = cert_players[slot].get("player_id") if slot < len(cert_players) else None
     entry = by_id.get(player_id) or {}
+    entry_env = entry.get("env") or {}
+    if str(entry_env.get("COWORLD_LLM_ENABLED", "")).lower() == "true":
+        llm_slots.append(slot)
     env_args = []
-    for key, value in (entry.get("env") or {}).items():
+    for key, value in entry_env.items():
         env_args += ["-e", f"{key}={value}"]
     for kv in extra_env:
         env_args += ["-e", kv]
@@ -175,13 +183,78 @@ for slot in range(seats):
         fh.write(" ".join(shlex.quote(a) for a in argv))
     print(f"slot {slot}: player_id={player_id or '(default)'} run={argv} env={len(env_args) // 2}")
 
+with open(os.path.join(work, "llm_slots"), "w") as fh:
+    fh.write(" ".join(str(s) for s in llm_slots))
 with open(os.path.join(work, "seats"), "w") as fh:
     fh.write(str(seats))
-print(f"game={game.get('name')} seats={seats} config={json.dumps(config)[:400]}")
+print(f"game={game.get('name')} seats={seats} llm_slots={llm_slots} config={json.dumps(config)[:400]}")
 PY
 
 seats="$(cat "${work_dir}/seats")"
+llm_slots="$(cat "${work_dir}/llm_slots")"
 chmod 777 "${work_dir}"
+
+# Start a test-only local HTTP Messages API stub when certification seats a
+# COWORLD_LLM_ENABLED=true player and no external endpoint is provided.
+stub_endpoint="${COWORLD_LLM_ENDPOINT:-}"
+if [ -n "${llm_slots}" ] && [ -z "${stub_endpoint}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+  python3 - "${work_dir}/stub.port" "${work_dir}/stub_calls.jsonl" <<'PY' &
+import json
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+port_path, log_path = sys.argv[1], sys.argv[2]
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_POST(self):
+        if self.path != "/v1/messages":
+            self.send_response(404)
+            self.end_headers()
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        body = json.loads(self.rfile.read(length).decode("utf-8"))
+        slot = self.headers.get("X-Coworld-Player-Slot")
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"slot": slot, "model": body.get("model")}) + "\n")
+        order = {
+            "intent": "burn_boss",
+            "target": "boss",
+            "station": "ranged",
+            "on_telegraph": "dodge",
+            "note": "ci smoke stub",
+            "say": "",
+        }
+        payload = json.dumps({
+            "id": "msg_smoke",
+            "type": "message",
+            "role": "assistant",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": json.dumps(order)}],
+        }).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+server = ThreadingHTTPServer(("0.0.0.0", 0), Handler)
+with open(port_path, "w", encoding="utf-8") as fh:
+    fh.write(str(server.server_address[1]))
+server.serve_forever()
+PY
+  stub_pid=$!
+  for _ in $(seq 1 50); do
+    [ -s "${work_dir}/stub.port" ] && break
+    sleep 0.1
+  done
+  test -s "${work_dir}/stub.port" || { echo "FAIL: smoke LLM stub did not start" >&2; exit 1; }
+  stub_port="$(cat "${work_dir}/stub.port")"
+  stub_endpoint="http://host.docker.internal:${stub_port}"
+  echo "started test-only LLM stub on port ${stub_port} for llm_slots=${llm_slots}"
+fi
 
 # --------------------------------------------------------------------------
 # Launch.
@@ -203,10 +276,19 @@ docker run -d --name "${prefix}-game" \
 for ((slot = 0; slot < seats; slot++)); do
   eval "penv=( $(cat "${work_dir}/env-${slot}.args") )"
   eval "pcmd=( $(cat "${work_dir}/cmd-${slot}.args") )"
-  if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-    penv+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
-  fi
+  extra_docker_args=()
+  case " ${llm_slots} " in
+    *" ${slot} "*)
+      if [ -n "${stub_endpoint}" ]; then
+        penv+=(-e "COWORLD_LLM_ENDPOINT=${stub_endpoint}")
+        extra_docker_args+=(--add-host=host.docker.internal:host-gateway)
+      elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+        penv+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
+      fi
+      ;;
+  esac
   docker run -d --name "${prefix}-p${slot}" --network "${network}" \
+    ${extra_docker_args[@]+"${extra_docker_args[@]}"} \
     -e COWORLD_PLAYER_WS_URL="ws://${prefix}-game:${port}/player?slot=${slot}&token=token-${slot}" \
     ${penv[@]+"${penv[@]}"} \
     "${image}" ${pcmd[@]+"${pcmd[@]}"} >/dev/null
@@ -257,7 +339,7 @@ done
 # --------------------------------------------------------------------------
 # Assert the artifacts.
 # --------------------------------------------------------------------------
-if ! python3 - "${work_dir}" "${seats}" "${require_replay_json}" <<'PY'
+if ! python3 - "${work_dir}" "${seats}" "${require_replay_json}" "${llm_slots}" "${stub_pid}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -265,6 +347,8 @@ from pathlib import Path
 work = Path(sys.argv[1])
 seats = int(sys.argv[2])
 require_replay_json = sys.argv[3] not in ("0", "", "false", "no")
+llm_slots = {int(x) for x in sys.argv[4].split() if x.strip()}
+used_stub = bool(sys.argv[5].strip())
 
 failure = work / "player_failure.json"
 if failure.exists():
@@ -303,6 +387,26 @@ if require_replay_json:
             f"replay is not valid UTF-8 JSON: {exc} "
             "(set SMOKE_REQUIRE_REPLAY_JSON=0 for a binary replay format)"
         ) from exc
+
+if llm_slots:
+    fb = results.get("fallback_turns") or []
+    if any(x != 0 for x in fb):
+        raise SystemExit(f"unexpected fallback_turns in results: {fb}")
+    llm_turns = results.get("llm_turns") or []
+    for s in sorted(llm_slots):
+        if s >= len(llm_turns) or llm_turns[s] < 1:
+            raise SystemExit(f"llm slot {s} recorded no llm_turns: {llm_turns}")
+    if used_stub:
+        calls_path = work / "stub_calls.jsonl"
+        if not calls_path.exists():
+            raise SystemExit("LLM stub received zero calls")
+        calls = [json.loads(line) for line in calls_path.read_text().splitlines() if line.strip()]
+        if not calls:
+            raise SystemExit("LLM stub received zero calls")
+        bad_slots = [c["slot"] for c in calls if str(c.get("slot")) not in {str(s) for s in llm_slots}]
+        if bad_slots:
+            raise SystemExit(f"LLM stub received calls from non-LLM slots: {bad_slots}")
+        print(f"LLM stub verified: {len(calls)} calls exclusively from slots {sorted(llm_slots)}")
 
 print(
     f"smoke OK: seats={seats} results={results_path.stat().st_size}B "

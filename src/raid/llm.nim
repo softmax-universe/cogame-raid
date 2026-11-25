@@ -263,7 +263,7 @@ proc newLlmClient*(): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "raid llm: no LLM credentials; using scripted fallback"
+    echo "raid llm: no LLM credentials configured"
 
 proc userPrompt*(view: JsonNode, prompt: string): string =
   ## The operator prompt never crosses the game socket or enters the replay.
@@ -288,10 +288,6 @@ proc requestFor*(client: LlmClient, system, user: string, slot: int):
   if client.transport == ltSidecar:
     result.url = client.sidecarEndpoint & "/v1/messages"
   else:
-    ## Only the Claude 5 / Opus tiers accept an effort setting; Haiku 4.5
-    ## rejects the whole request with a 400 if it is present.
-    if "haiku" notin client.model and "4-5" notin client.model:
-      body["output_config"] = %*{"effort": "low"}
     headers["x-api-key"] = client.apiKey
     headers["anthropic-version"] = AnthropicVersion
     result.url = AnthropicUrl

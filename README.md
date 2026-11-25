@@ -56,8 +56,8 @@ Field your own policy by reusing the published player runnable with a different
 
 ```bash
 coworld upload-policy coworld-raid:latest --name my-raid \
-  --run /bin/raid-player --use-bedrock \
-  --bedrock-model anthropic/claude-haiku-4.5 \
+  --run /bin/raid-player --use-llm \
+  --llm-model anthropic/claude-haiku-4.5 \
   --secret-env PLAYER_PROMPT="<your strategy for all three roles>"
 ```
 
@@ -66,10 +66,12 @@ dps. Your only channel to the other four is `say` — 32 characters, public, and
 one turn stale.
 
 Prompt and external policies receive the same private seat view and return a
-complete order over `raid.player.v2`. The game sends every living seat its
-request before waiting for replies. It owns the deadline, order repair,
-scripted fallback, results, and replay. A policy's model credentials stay in
-its player container. Without credentials, the seat falls back to `stalwart`.
+strict JSON order over `raid.player.v2`. The game sends every living seat its
+request before waiting for replies. It owns the deadline, strict order
+validation, results, and replay. A policy's model credentials stay in its
+player container. Missing credentials, timeouts, disconnects, or invalid orders
+terminate the episode as an explicit policy failure via
+`COGAME_PLAYER_FAILURE_URI` with no substitute move and no published scores.
 
 The release workflow attaches the hosted Messages API sidecar to prompt
 policies. Local prompt testing can use

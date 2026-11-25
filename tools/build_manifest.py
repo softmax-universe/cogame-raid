@@ -46,9 +46,10 @@ DESCRIPTION = (
     "timer), and every seat carries the identical number, so a healer who "
     "never touches the boss can be a champion. Prompt and external policies "
     "receive private seat views through the ordinary player socket and "
-    "return complete orders. The game owns timing, order repair, fallback, "
-    "results and replay. Stalwart and greenhorn are scripted baselines. "
-    "Seats without model credentials fall back to stalwart."
+    "return complete orders. The game owns timing, strict order validation, "
+    "results and replay. Stalwart and greenhorn are explicit scripted "
+    "baselines. Model seats require credentials and fail the episode without "
+    "substituting a move if a decision is missing or invalid."
 )
 
 CONFIG_SCHEMA = {
@@ -249,11 +250,13 @@ PLAYER_PROTOCOL = (
     "{\"type\":\"action\",\"id\":int,\"action\":order} or "
     "{\"type\":\"action\",\"id\":int,\"cause\":str,"
     "\"error\":str}. The game sends every living seat's private view "
-    "concurrently, validates and repairs orders, and owns bounded retries, "
-    "fallback, results and replay. The player owns policy inference. "
-    "The order has intent, target, station, point, on_telegraph, note and say. "
-    "After each turn the game sends an informational turn frame; at the end "
-    "it sends {\"done\":true,\"result\":object}. See docs/PROTOCOL.md."
+    "concurrently, strictly validates orders against the seat's role and "
+    "world state, and owns bounded retries, explicit policy failure, results "
+    "and replay. No substitute move is fabricated on failure. The player owns "
+    "policy inference. The order has intent, target, station, point, "
+    "on_telegraph, note and say. After each turn the game sends an "
+    "informational turn frame; at the end it sends "
+    "{\"done\":true,\"result\":object}. See docs/PROTOCOL.md."
 )
 
 GLOBAL_PROTOCOL = (
@@ -304,7 +307,7 @@ def variant(vid, name, description, boss, enrage, max_ticks, wall):
     }
 
 
-def player_entry(pid, name, description, scripted):
+def player_entry(pid, name, description, env=None):
     entry = {
         "id": pid, "name": name, "type": "player", "description": description,
         "image": "{{RAID_IMAGE}}", "run": ["/bin/raid-player"],
@@ -314,8 +317,8 @@ def player_entry(pid, name, description, scripted):
         },
         "source_url": SOURCE_URL,
     }
-    if scripted:
-        entry["env"] = {"PLAYER_SCRIPTED": scripted}
+    if env:
+        entry["env"] = dict(env)
     return entry
 
 
@@ -362,18 +365,22 @@ def build():
                 "The bundled certification player and the default baseline: "
                 "the correct execution of the encounter, played by the server "
                 "with no LLM involved.",
-                "stalwart"),
+                {"PLAYER_SCRIPTED": "stalwart"}),
             player_entry(
                 "greenhorn", "greenhorn",
                 "The weaker scripted baseline: everyone in melee, everyone "
                 "dodging everything, nobody interrupting, nobody soaking, adds "
                 "ignored. A clean floor for the ladder.",
-                "greenhorn"),
+                {"PLAYER_SCRIPTED": "greenhorn"}),
             player_entry(
                 "raid-player", "Raid Prompt Player",
-                "The reference prompt policy answers private decision views "
-                "with complete orders. Field your own with PLAYER_PROMPT.",
-                None),
+                "The reference LLM prompt policy answers private decision views "
+                "with strict JSON orders via the Coworld LLM sidecar. Field "
+                "your own with PLAYER_PROMPT.",
+                {
+                    "COWORLD_LLM_ENABLED": "true",
+                    "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5",
+                }),
         ],
         "variants": [
             variant("default", "SMELTER-9 (5 cogs, 240 s enrage)",

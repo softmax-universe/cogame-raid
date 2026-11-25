@@ -123,6 +123,19 @@ proc testImageNamesAgreeWithCompose() =
       entry["id"].getStr() & " uses the player image placeholder")
     checkEq(entry["run"][0].getStr(), "/bin/raid-player",
       entry["id"].getStr() & " runs the player entrypoint")
+    let pid = entry["id"].getStr()
+    if pid == "raid-player":
+      checkEq(entry["env"]["COWORLD_LLM_ENABLED"].getStr(), "true",
+        "raid-player explicitly declares COWORLD_LLM_ENABLED=true")
+      check(entry["env"]["COWORLD_LLM_MODEL"].getStr().len > 0,
+        "raid-player explicitly declares COWORLD_LLM_MODEL")
+      check(not entry["env"].hasKey("PLAYER_SCRIPTED"),
+        "raid-player is not scripted")
+    else:
+      check(not entry["env"].hasKey("COWORLD_LLM_ENABLED"),
+        pid & " does not request LLM routing")
+      check(entry["env"]["PLAYER_SCRIPTED"].getStr() in ["stalwart", "greenhorn"],
+        pid & " declares an explicit scripted baseline")
   checkEq(m["game"]["runnable"]["run"][0].getStr(), "/bin/raid",
     "and the game runs /bin/raid")
   let compose = repoFile("compose.yaml")
