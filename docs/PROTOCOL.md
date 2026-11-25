@@ -172,10 +172,12 @@ byte-truncated multi-byte character is exactly the bug that makes replay bytes
 render in a browser and fail a strict JSON parser.
 
 **Parsing is strict:** the model reply must be a single valid JSON object
-beginning with `{` (no markdown fences, no prose preamble, no legacy numeric
-target aliases). Any parse or validation failure triggers at most one retry
-within the turn budget, and if still invalid, ends the episode as an explicit
-policy failure with no substitute move.
+(optionally wrapped in a single ```` ```json ```` code fence), with no prose
+preamble or trailer, no brace scraping, and no legacy numeric target aliases.
+Any parse or validation failure triggers at most one retry within the turn
+budget, and if still invalid, ends the episode as an explicit policy failure
+via `COGAME_PLAYER_FAILURE_URI` with no substitute move and no published
+`results.json` (retaining partial replay progress when ticks have elapsed).
 
 ### The control layer
 

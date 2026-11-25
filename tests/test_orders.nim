@@ -25,17 +25,29 @@ proc testStrictJsonObjectOnly() =
   checkEq($valid.intent, "tank_boss", "clean JSON object parses")
   checkEq($valid.station, "melee", "station parses")
   checkEq($valid.onTelegraph, "hold", "on_telegraph parses")
+  let fencedJson = world.parseStrictFor(0,
+    "```json\n{\"intent\":\"taunt\",\"target\":\"boss\",\"station\":\"melee\",\"on_telegraph\":\"hold\"}\n```")
+  checkEq($fencedJson.intent, "taunt", "single ```json fence parses")
+  let fencedPlain = world.parseStrictFor(2,
+    "```\n{\"intent\":\"burn_boss\",\"target\":\"boss\",\"station\":\"ranged\",\"on_telegraph\":\"dodge\"}\n```")
+  checkEq($fencedPlain.intent, "burn_boss", "single plain ``` fence parses")
   world.mustReject(0,
     "Let me think.\n{\"intent\":\"tank_boss\",\"target\":\"boss\",\"station\":\"melee\",\"on_telegraph\":\"hold\"}",
     "prose-prefixed JSON is rejected")
   world.mustReject(0,
-    "```json\n{\"intent\":\"taunt\",\"target\":\"boss\",\"station\":\"melee\",\"on_telegraph\":\"hold\"}\n```",
-    "markdown-fenced JSON is rejected")
+    "Here is my order:\n```json\n{\"intent\":\"taunt\",\"target\":\"boss\",\"station\":\"melee\",\"on_telegraph\":\"hold\"}\n```",
+    "prose before a code fence is rejected")
+  world.mustReject(0,
+    "```json\n{\"intent\":\"taunt\",\"target\":\"boss\",\"station\":\"melee\",\"on_telegraph\":\"hold\"}\n```\nDone.",
+    "prose after a code fence is rejected")
+  world.mustReject(0,
+    "```json\n{\"intent\":\"taunt\",\"target\":\"boss\",\"station\":\"melee\",\"on_telegraph\":\"hold\"}\n```\n```json\n{\"intent\":\"wait\",\"station\":\"melee\",\"on_telegraph\":\"hold\"}\n```",
+    "multiple code fences are rejected")
   world.mustReject(2,
     "{\"intent\":\"burn_boss\",\"target\":\"boss\",\"station\":\"ranged\",\"on_telegraph\":\"dodge\"} trailing prose",
     "trailing prose is rejected")
   world.mustReject(2, "I refuse to answer.", "non-JSON text is rejected")
-  done("strict JSON object parsing rejects prose and markdown fences")
+  done("strict JSON object parsing accepts bare or single-fenced JSON and rejects prose")
 
 proc testUnknownAndWrongRoleEnumsRejected() =
   var world = quietWorld()

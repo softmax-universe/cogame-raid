@@ -4,22 +4,43 @@
 import std/[json, strutils, unicode]
 import types, state, labels
 
-proc parseJsonObject*(text: string): JsonNode =
-  ## Parses a strict single JSON object. No markdown fences or prose scraping.
+proc unwrapSingleFence(text: string): string =
+  ## Unwraps a single markdown code fence (``` or ```json) when it is the
+  ## entire reply. Any prose before/after or multiple fences are rejected.
   let trimmed = text.strip()
+  if not trimmed.startsWith("```"):
+    return trimmed
+  let nl = trimmed.find('\n')
+  if nl < 0:
+    return ""
+  let header = trimmed[3 ..< nl].strip().toLowerAscii()
+  if header.len > 0 and header != "json":
+    return ""
+  let bodyAndClose = trimmed[nl + 1 .. ^1]
+  if not bodyAndClose.endsWith("```"):
+    return ""
+  let inner = bodyAndClose[0 ..< bodyAndClose.len - 3]
+  if "```" in inner:
+    return ""
+  inner.strip()
+
+proc parseJsonObject*(text: string): JsonNode =
+  ## Parses a strict single JSON object, optionally wrapped in a single code
+  ## fence. No prose preamble/trailer and no brace scraping.
+  let trimmed = unwrapSingleFence(text)
   if trimmed.len == 0 or trimmed[0] != '{':
-    var head = trimmed
-    if head.runeLen > 160:
-      head = head.runeSubStr(0, 160) & "..."
+    var head = text.strip()
+    if head.runeLen > 400:
+      head = head.runeSubStr(0, 400) & "..."
     raise newException(RaidError,
-      "response must be a single JSON object starting with '{': " &
+      "response must be a single JSON object: " &
         head.replace("\n", " "))
   let parsed = try:
     parseJson(trimmed)
   except CatchableError as error:
-    var head = trimmed
-    if head.runeLen > 160:
-      head = head.runeSubStr(0, 160) & "..."
+    var head = text.strip()
+    if head.runeLen > 400:
+      head = head.runeSubStr(0, 400) & "..."
     raise newException(RaidError,
       "invalid JSON object (" & error.msg & "): " & head.replace("\n", " "))
   if parsed.kind != JObject:

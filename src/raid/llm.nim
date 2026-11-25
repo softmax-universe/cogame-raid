@@ -37,9 +37,9 @@ do not drive motors directly, and you cannot react faster than your order allows
 choose the reaction, not the dodge.
 """
 
-  RetryHint* = "\nYour previous reply was invalid, reply with a single JSON " &
-    "object beginning with '{' carrying at least an \"intent\" legal for " &
-    "your role."
+  RetryHint* = "\nYour previous reply was invalid. Reply with a single JSON " &
+    "object (optionally in one code fence) carrying intent, station, and " &
+    "on_telegraph legal for your role."
 
 const ReferenceRules = """Combat detail: threat retargeting happens once a second, outside a taunt lock,
 and requires more than 10% extra threat to replace a living target. Enrage
@@ -53,24 +53,19 @@ health removed, regardless of when the encounter ended. Individual damage and
 healing meters do not affect the score.
 """
 
-const ReplyRules = """Reply with a single JSON object and NOTHING else. Your reply MUST begin with '{'.
-Schema:
-{"intent":"<one of the legal intents for your role>",
- "target":"boss|A1..A8|Alpha|Bravo|Charlie|Delta|Echo|null",
- "station":"melee|ranged|spread|edge|point|soak",
- "point":[x,y],              // used when station is "point"; clamped into the pit
- "on_telegraph":"dodge|hold|soak|spread",
- "note":"<=160 chars",       // your reasoning, shown to spectators only
- "say":"<=32 chars"}         // one short callout; your four team-mates SEE this next turn
+const ReplyRules = """Reply with a single JSON object (optionally in one ```json code fence) and nothing else.
+Required keys: intent, station, on_telegraph. Optional keys: target, point (required when station is "point"), note (<=160 chars, spectator-only), say (<=32 chars, shown to team-mates next turn).
+Example:
+{"intent":"burn_boss","target":"boss","station":"ranged","on_telegraph":"dodge","say":""}
 Tank intents: tank_boss, taunt, pick_up_adds, kite, soak, wait.
 Healer intents: heal_lowest, heal_target, shield_target, conserve, soak, wait.
 Dps intents: burn_boss, kill_adds, interrupt, assist_target, soak, wait.
-Stations: melee = 40 px ring around your target; ranged = 260 px ring from the boss;
-spread = at least 140 px from every team-mate; edge = the pit rim behind you;
-point = the exact point you named; soak = the middle of the live pour circle.
+Targets: boss, A1..A8, Alpha..Echo, or null.
+Stations: melee = 40 px ring around target; ranged = 260 px ring from boss;
+spread = at least 140 px from nearest team-mate; edge = 280 px pit rim;
+point = [x,y] clamped into pit; soak = live pour circle centre.
 on_telegraph: dodge = leave the shape; hold = stay and keep attacking; soak = step into
-a pour circle; spread = get 140 px from everyone. The tank normally holds cleaves and
-everyone else dodges them.
+a pour circle; spread = 160 px from the centroid of other cogs.
 """
 
 proc systemPrompt*(selection: PromptSelection, config: GameConfig): string =
@@ -236,6 +231,7 @@ type
     model*: string
     maxOutputTokens*: int
     disabled*: bool
+    disabledReason*: string
 
   LlmError* = object of RaidError
 
@@ -251,7 +247,8 @@ proc newLlmClient*(): LlmClient =
   if sidecarEndpoint.len > 0:
     result.transport = ltSidecar
     result.sidecarEndpoint = sidecarEndpoint.strip(chars = {'/'}, leading = false)
-    result.model = getEnv("COWORLD_LLM_MODEL", "anthropic/claude-haiku-4.5")
+    let envModel = getEnv("COWORLD_LLM_MODEL").strip()
+    result.model = if envModel.len > 0: envModel else: "anthropic/claude-haiku-4.5"
     result.curl = newCurly()
     echo "raid llm: sidecar transport, model ", result.model
     return
@@ -304,9 +301,10 @@ proc textOf*(client: LlmClient, response: Response, error, url: string):
     raise newException(LlmError, "llm transport: " & error)
   if response.code == 401 or response.code == 403:
     let detail = runeCap(response.body, 400)
+    let msg = "llm auth failed (" & $response.code & ") at " & url & ": " & detail
     client.disabled = true
-    raise newException(LlmError,
-      "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
+    client.disabledReason = msg
+    raise newException(LlmError, msg)
   if response.code == 429:
     let detail = runeCap(response.body, 300)
     raise newException(LlmError, "llm throttled (429): " & detail)
